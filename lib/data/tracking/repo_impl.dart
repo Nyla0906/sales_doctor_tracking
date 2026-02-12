@@ -1,7 +1,9 @@
-import '../../features/profile/models/session_points.dart';
-import '../../features/profile/models/tracking_session.dart';
-import '../../features/activity/models/tracking_point.dart';
+import 'package:sales_doctor_tracking_app/features/profile/models/session_points.dart';
+import 'package:sales_doctor_tracking_app/features/profile/models/tracking_session.dart';
+import 'package:sales_doctor_tracking_app/features/activity/models/tracking_point.dart';
 import 'api.dart';
+import 'local /session_dao.dart';
+import 'local /session_entity.dart';
 
 class StartSessionRes {
   final String sessionId;
@@ -14,7 +16,31 @@ class StartSessionRes {
 
 class TrackingRepoImpl {
   final TrackingApi api;
-  TrackingRepoImpl({required this.api});
+  final SessionDao sessionDao;
+
+  TrackingRepoImpl({
+    required this.api,
+    required this.sessionDao,
+  });
+
+  SessionEntity _toEntity(TrackingSession s) {
+    return SessionEntity(
+      sessionId: s.sessionId,
+      startTime: s.startTime.toUtc().toIso8601String(),
+      status: s.status,
+      stopTime: s.stopTime?.toUtc().toIso8601String(),
+    );
+  }
+
+  TrackingSession _fromEntity(SessionEntity e) {
+    return TrackingSession(
+      sessionId: e.sessionId,
+      startTime: DateTime.parse(e.startTime),
+      stopTime: e.stopTime == null ? null : DateTime.parse(e.stopTime!),
+      status: e.status,
+      lastPointAt: null, // hozir DBga saqlamayapmiz
+    );
+  }
 
   Future<StartSessionRes> startSession() async {
     final data = await api.startSession();
@@ -33,6 +59,13 @@ class TrackingRepoImpl {
       stopLat: stopLat,
       stopLon: stopLon,
     );
+
+    // ✅ Stop bo‘ldi degani: DB’da ham statusni yangilab qo‘yamiz
+    await sessionDao.markStopped(
+      sessionId,
+      'STOPPED',
+      stopTime.toUtc().toIso8601String(),
+    );
   }
 
   Future<void> ingestPoints(String sessionId, List<TrackingPoint> points) async {
@@ -41,10 +74,24 @@ class TrackingRepoImpl {
   }
 
   Future<List<TrackingSession>> mySessions() async {
-    final list = await api.mySessions();
-    return list
-        .map((e) => TrackingSession.fromJson(e as Map<String, dynamic>))
-        .toList();
+    // 1) DB’dan (tez / offline)
+    final cached = await sessionDao.getAll();
+    final cachedModels = cached.map(_fromEntity).toList();
+
+    try {
+      // 2) API’dan
+      final list = await api.mySessions();
+      final remote = list
+          .map((e) => TrackingSession.fromJson(e as Map<String, dynamic>))
+          .toList();
+
+      // 3) DB’ni update
+      await sessionDao.upsertAll(remote.map(_toEntity).toList());
+
+      return remote;
+    } catch (_) {
+      return cachedModels;
+    }
   }
 
   Future<List<SessionPoint>> mySessionPoints(
